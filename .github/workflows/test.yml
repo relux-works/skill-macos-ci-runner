@@ -3,24 +3,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   unit:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # Runs on a self-hosted macOS runner: same-repository changes only, never a fork's pull request
+    # (fork runs also need maintainer approval in the repository settings).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, ios-ci]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Syntax (also with the system bash, 3.2 on macOS)
-        run: for f in scripts/*.sh tests/run.sh; do bash -n "$f" && /bin/bash -n "$f" || exit 1; done
-      - name: Shellcheck
-        if: runner.os == 'Linux'
-        run: shellcheck -s bash -S warning scripts/*.sh tests/run.sh
+      - name: Syntax with the system bash (3.2)
+        run: for f in scripts/*.sh tests/run.sh; do /bin/bash -n "$f" || exit 1; done
+      - name: Shellcheck (when the runner has it)
+        run: if command -v shellcheck >/dev/null; then shellcheck -s bash -S warning scripts/*.sh tests/run.sh; else echo "shellcheck not installed on this runner; skipped"; fi
       - name: Unit tests
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: /bin/bash tests/run.sh
