@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- OPTIONAL boot-time unlock of the CI volume. Replace __LABEL_PREFIX__, __SUPPORT__ and __VOL_MOUNT__ with LABEL_PREFIX,
+     SUPPORT_ROOT and /Volumes/<VOL_NAME> from ci-runner.conf, install as /Library/LaunchDaemons/__LABEL_PREFIX__.volume-unlock.plist
+     (root:wheel 0644). See references/RUNBOOK.md. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL_PREFIX__.volume-unlock</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__SUPPORT__/sbin/volume-unlock.sh</string>
+    <string>__SUPPORT__</string>
+    <string>__LABEL_PREFIX__.volume</string>
+    <string>__VOL_MOUNT__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/__LABEL_PREFIX__.volume-unlock.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/__LABEL_PREFIX__.volume-unlock.log</string>
+</dict>
+</plist>

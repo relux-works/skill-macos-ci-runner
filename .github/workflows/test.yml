@@ -1,0 +1,26 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Syntax (also with the system bash, 3.2 on macOS)
+        run: for f in scripts/*.sh tests/run.sh; do bash -n "$f" && /bin/bash -n "$f" || exit 1; done
+      - name: Shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck -s bash -S warning scripts/*.sh tests/run.sh
+      - name: Unit tests
+        run: /bin/bash tests/run.sh

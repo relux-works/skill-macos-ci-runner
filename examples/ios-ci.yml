@@ -1,0 +1,307 @@
+# Example iOS CI workflow for a host prepared with this skill (one runner group, one job at a time), for a
+# Tuist-generated workspace with local Swift packages under Packages/. Adapt the env block (workspace, scheme,
+# test targets) and the steps to your repository.
+#
+# Host contract, enforced by the runner's root-owned job hooks:
+# - The runner account holds no secrets, Apple ID, signing identity or SSH key, and has no Homebrew.
+#   This workflow uses no secrets and installs nothing.
+# - The home is append-only and its startup files are immutable. Never run `git config --global` and
+#   never create files at the top of $HOME. Everything this job writes goes to the workspace or to
+#   $RUNNER_TEMP, which the runner empties at the start and end of every job.
+# - Leave no process behind. The next job's start hook refuses any non-Apple process left in the CI
+#   session, so the simulator is shut down at the end of every run, whatever the outcome.
+name: ios-ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      host_qualification:
+        description: Also run the host's job-environment readback (qualify.sh ci)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-test:
+    name: Build and test (iOS Simulator)
+    # Same-repository pull requests only. Fork pull requests never reach this runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      group: macos-ci                                  # RUNNER_GROUP
+      labels: [self-hosted, macOS, ARM64, macos-ci]    # RUNNER_EXTRA_LABEL
+    timeout-minutes: 150
+    env:
+      SIMULATOR_NAME: CI iPhone                         # SIMULATOR_NAME
+      WORKSPACE: App.xcworkspace
+      SCHEME: App
+      UNIT_TEST_TARGET: AppTests
+      UI_TEST_TARGET: AppUITests
+      # Put project-specific switches for a CI build here (for example to skip steps that need network
+      # credentials or files the CI account does not have). The runner holds no secrets.
+      TUIST_CONFIG_STATS_OPT_OUT: '1'
+      NSUnbufferedIO: 'YES'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare job scratch under RUNNER_TEMP
+        timeout-minutes: 2
+        run: |
+          scratch="$RUNNER_TEMP/ci"
+          mkdir -p "$scratch/derived-data" "$scratch/xdg-cache/spm" "$scratch/xdg-state" \
+            "$scratch/results" "$scratch/logs"
+          # XDG_CACHE_HOME moves Tuist's and SwiftPM's caches into the job, and `swift test` gets an
+          # explicit --cache-path below it, so nothing is cached in the CI account's home.
+          {
+            echo "CI_SCRATCH=$scratch"
+            echo "DERIVED_DATA=$scratch/derived-data"
+            echo "XDG_CACHE_HOME=$scratch/xdg-cache"
+            echo "XDG_STATE_HOME=$scratch/xdg-state"
+            echo "SPM_CACHE=$scratch/xdg-cache/spm"
+            echo "RESULTS_DIR=$scratch/results"
+            echo "LOG_DIR=$scratch/logs"
+          } >>"$GITHUB_ENV"
+
+      - name: Toolchain readback (Xcode, SDK, Swift, Tuist, CI iPhone)
+        timeout-minutes: 5
+        run: |
+          echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH user=$(id -un) home=$HOME"
+          echo "DEVELOPER_DIR=${DEVELOPER_DIR:-unset} xcode-select=$(xcode-select -p)"
+          xcodebuild -version
+          if ! xcodebuild -checkFirstLaunchStatus; then
+            echo "::error title=Toolchain::Xcode first launch is not complete for this Xcode (root: xcodebuild -runFirstLaunch)"
+            exit 1
+          fi
+          if ! xcodebuild -license check; then
+            echo "::error title=Toolchain::the Xcode license is not accepted for this Xcode"
+            exit 1
+          fi
+          echo "iphonesimulator SDK $(xcrun --sdk iphonesimulator --show-sdk-version) ($(xcrun --sdk iphonesimulator --show-sdk-build-version))"
+          swift --version
+
+          tuist_bin=$(command -v tuist) || { echo "::error title=Toolchain::tuist is not on PATH"; exit 1; }
+          tuist_version=$(tuist version | tail -n 1 | tr -d '[:space:]')
+          echo "tuist $tuist_version at $tuist_bin"
+          # Optional: enforce your repository's Tuist version range here (the host pins one version).
+          [ -n "$tuist_version" ] || { echo "::error title=Toolchain::tuist printed no version"; exit 1; }
+
+          xcrun simctl list runtimes available
+          # Exactly one available device named "$SIMULATOR_NAME"; every later step targets its UDID.
+          sims=$(xcrun simctl list devices available | awk -v name="$SIMULATOR_NAME" '
+            /^-- .* --$/ { runtime = $0; sub(/^-- /, "", runtime); sub(/ --$/, "", runtime); next }
+            {
+              line = $0; sub(/^[[:space:]]+/, "", line); prefix = name " ("
+              if (index(line, prefix) == 1) {
+                rest = substr(line, length(prefix) + 1)
+                print substr(rest, 1, index(rest, ")") - 1) " " runtime
+              }
+            }')
+          count=$(printf '%s' "$sims" | grep -c '^' || true)
+          if [ "$count" != 1 ]; then
+            echo "::error title=Simulator::expected exactly one available device named '$SIMULATOR_NAME', found $count"
+            xcrun simctl list devices available
+            exit 1
+          fi
+          udid=${sims%% *}
+          runtime=${sims#* }
+          if [[ ! $udid =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || [[ $runtime != "iOS "* ]]; then
+            echo "::error title=Simulator::unexpected device line for '$SIMULATOR_NAME': $sims"
+            exit 1
+          fi
+          echo "$SIMULATOR_NAME: $udid on $runtime"
+          {
+            echo "SIM_UDID=$udid"
+            echo "DESTINATION=platform=iOS Simulator,id=$udid"
+          } >>"$GITHUB_ENV"
+
+          df -h "$RUNNER_TEMP" /System/Volumes/Data
+          sysctl vm.swapusage
+
+      # The host's own readback of the job environment (identity, network blocks, git and toolchain
+      # settings). Manual runs only: it is qualification evidence, not an app check.
+      - name: Host qualification readback (qualify.sh ci)
+        if: github.event_name == 'workflow_dispatch' && inputs.host_qualification
+        timeout-minutes: 5
+        run: |
+          q=/opt/macos-ci/setup/qualify.sh   # SUPPORT_ROOT/setup
+          if [ ! -f "$q" ] || [ -L "$q" ] || [ "$(stat -f %Su "$q")" != root ]; then
+            echo "::error title=Host qualification::$q is missing, a symlink or not root-owned"
+            exit 1
+          fi
+          shasum -a 256 "$q"
+          /bin/bash "$q" ci 2>&1 | tee "$LOG_DIR/host-qualification-ci.log"
+
+      - name: Resolve Swift packages (tuist install)
+        timeout-minutes: 20
+        run: tuist install 2>&1 | tee "$LOG_DIR/tuist-install.log"
+
+      - name: Generate the workspace (tuist generate)
+        timeout-minutes: 15
+        run: |
+          tuist generate --no-open 2>&1 | tee "$LOG_DIR/tuist-generate.log"
+          if [ ! -d "$WORKSPACE" ]; then
+            echo "::error title=Generate::$WORKSPACE was not generated"
+            exit 1
+          fi
+
+      # Every local package under Packages/ with a job-scoped SwiftPM cache and XUnit reports. Stops at the
+      # first failing package.
+      - name: Package tests (swift test, every package under Packages/)
+        timeout-minutes: 60
+        run: |
+          mkdir -p "$RESULTS_DIR/package-tests" "$LOG_DIR/package-tests"
+          n=0
+          while IFS= read -r manifest; do
+            dir=${manifest%/Package.swift}; package=${dir##*/}
+            n=$((n + 1))
+            echo "::group::[$n] swift test $dir"
+            if swift test --package-path "$dir" --cache-path "$SPM_CACHE" --jobs 6 \
+                 --xunit-output "$RESULTS_DIR/package-tests/$package.xml" \
+                 2>&1 | tee "$LOG_DIR/package-tests/$package.log"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error title=Package tests::swift test failed in $dir"
+              exit 1
+            fi
+          done < <(find Packages -mindepth 2 -maxdepth 2 -name Package.swift 2>/dev/null | LC_ALL=C sort)
+          echo "package tests passed in $n packages"
+
+      # ONLY_ACTIVE_ARCH=YES: arm64 only; the x86_64 simulator slice has no
+      # consumer on this Apple silicon host and would double the slowest step.
+      - name: Build, Release, iOS Simulator (code signing disabled)
+        timeout-minutes: 60
+        run: |
+          xcodebuild build \
+            -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+            -destination "$DESTINATION" -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RESULTS_DIR/build-release.xcresult" \
+            -jobs 6 -quiet -hideShellScriptEnvironment \
+            COMPILER_INDEX_STORE_ENABLE=NO ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$LOG_DIR/build-release.log"
+
+      # Default simulator signing: ad hoc ("Sign to Run Locally"), no identity, account or profile.
+      # Keep it if your UI tests need keychain-group or other entitlements: they apply only when the app is signed.
+      - name: Build for testing, Debug (simulator ad hoc signing)
+        timeout-minutes: 45
+        run: |
+          xcodebuild build-for-testing \
+            -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Debug \
+            -destination "$DESTINATION" -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RESULTS_DIR/build-for-testing.xcresult" \
+            -jobs 6 -quiet -hideShellScriptEnvironment \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$LOG_DIR/build-for-testing.log"
+
+      - name: Boot CI iPhone
+        timeout-minutes: 10
+        run: xcrun simctl bootstatus "$SIM_UDID" -b
+
+      - name: Unit tests (CI iPhone)
+        timeout-minutes: 20
+        run: |
+          xcodebuild test-without-building \
+            -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Debug \
+            -destination "$DESTINATION" -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RESULTS_DIR/unit-tests.xcresult" \
+            -only-testing:"$UNIT_TEST_TARGET" \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 300 \
+            2>&1 | tee "$LOG_DIR/unit-tests.log"
+
+      # UI tests get one retry: on small hosts they time out under memory pressure (references/PITFALLS.md).
+      # Unit tests get none.
+      - name: UI tests (CI iPhone)
+        timeout-minutes: 45
+        run: |
+          xcodebuild test-without-building \
+            -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Debug \
+            -destination "$DESTINATION" -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RESULTS_DIR/ui-tests.xcresult" \
+            -only-testing:"$UI_TEST_TARGET" \
+            -parallel-testing-enabled NO -retry-tests-on-failure -test-iterations 2 \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 300 \
+            2>&1 | tee "$LOG_DIR/ui-tests.log"
+
+      - name: Shut down simulators
+        if: always()
+        timeout-minutes: 3
+        run: |
+          xcrun simctl shutdown all || echo "::warning title=Simulator::simctl shutdown all failed"
+          booted=$(xcrun simctl list devices booted | grep -c '(Booted)' || true)
+          if [ "$booted" != 0 ]; then
+            echo "::warning title=Simulator::$booted simulator(s) still booted after shutdown"
+          fi
+
+      # Evidence for sizing (nothing is cleaned yet, so this is about the peak) and an early warning
+      # for the next job's start hook. The process check is an approximation; the hook is authoritative.
+      - name: Report resource use and session leftovers
+        if: always()
+        timeout-minutes: 5
+        run: |
+          df -h "$RUNNER_TEMP" /System/Volumes/Data || true
+          sysctl vm.swapusage || true
+          du -sh "${CI_SCRATCH:-$RUNNER_TEMP}"/* "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # The runner service is this step's oldest ancestor below launchd; everything else that
+          # launchd adopted outlives the job, and only Apple agents may.
+          root=$$
+          while p=$(ps -o ppid= -p "$root" | tr -d ' ') && [ -n "$p" ] && [ "$p" != 1 ]; do root=$p; done
+          left=0
+          while read -r pid ppid exe; do
+            if [ "$ppid" = 1 ] && [ "$pid" != "$root" ]; then
+              case "$exe" in
+                /System/*|/usr/libexec/*|/usr/sbin/*|/Library/Apple/*|/Library/Developer/PrivateFrameworks/*|\
+                /Library/Developer/CoreSimulator/*|/usr/bin/ssh-agent|/Applications/Xcode.app/*/XPCServices/*) ;;
+                *)
+                  left=$((left + 1))
+                  echo "::warning title=Session leftover::pid $pid ($exe) outlives the job; the next job's start hook refuses non-Apple processes"
+                  ;;
+              esac
+            fi
+          done <<<"$(ps -U "$(id -u)" -o pid=,ppid=,comm=)"
+          echo "processes left outside the Apple allowlist: $left"
+
+      # Artifact storage for private repositories is limited, so the large build result bundles are kept only
+      # for failed runs, and an upload problem never hides a test result.
+      - name: Upload logs and test results
+        if: always() && env.CI_SCRATCH != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.LOG_DIR }}
+            ${{ env.RESULTS_DIR }}/package-tests
+            ${{ env.RESULTS_DIR }}/unit-tests.xcresult
+            ${{ env.RESULTS_DIR }}/ui-tests.xcresult
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload build result bundles (failed runs only)
+        if: failure() && env.CI_SCRATCH != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-ci-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}/build-*.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
